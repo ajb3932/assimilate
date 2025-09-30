@@ -1,9 +1,11 @@
 const express = require('express');
 const cors = require('cors');
-const helmet = require('helmet');
 const morgan = require('morgan');
 const compression = require('compression');
+const path = require('path');
 const { Pool } = require('pg');
+const fs = require('fs').promises;
+const yaml = require('js-yaml');
 require('dotenv').config();
 
 const app = express();
@@ -17,12 +19,23 @@ const pool = new Pool({
   connectionTimeoutMillis: 2000,
 });
 
-// Middleware
-app.use(helmet());
-app.use(cors());
+// Middleware - Minimal security for HTTP home use
+app.use(cors({
+  origin: '*',
+  credentials: false
+}));
 app.use(compression());
 app.use(morgan('combined'));
 app.use(express.json());
+
+// Simple headers middleware for HTTP
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  next();
+});
+
+// Serve static files from the React app build
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Health check endpoint
 app.get('/api/health', async (req, res) => {
@@ -87,6 +100,7 @@ app.get('/api/repositories', async (req, res) => {
         r.name,
         r.path,
         r.location_type,
+        r.size_on_disk_bytes,
         COUNT(ba.id) as archive_count,
         COALESCE(SUM(ba.original_size_bytes), 0) as total_size,
         MAX(ba.created_at) as last_backup,
@@ -98,7 +112,7 @@ app.get('/api/repositories', async (req, res) => {
         END as health_status
       FROM repositories r
       LEFT JOIN backup_archives ba ON r.id = ba.repository_id
-      GROUP BY r.id, r.name, r.path, r.location_type
+      GROUP BY r.id, r.name, r.path, r.location_type, r.size_on_disk_bytes
       ORDER BY r.name
     `;
 
@@ -107,6 +121,7 @@ app.get('/api/repositories', async (req, res) => {
       ...repo,
       archive_count: Number(repo.archive_count),
       total_size: Number(repo.total_size),
+      size_on_disk_bytes: repo.size_on_disk_bytes ? Number(repo.size_on_disk_bytes) : null,
       hours_since_backup: repo.hours_since_backup ? Number(repo.hours_since_backup) : null
     }));
 
@@ -228,15 +243,74 @@ app.get('/api/health-status', async (req, res) => {
   }
 });
 
+// Get borgmatic configuration
+app.get('/api/borgmatic-config', async (req, res) => {
+  try {
+    const { exec } = require('child_process');
+    const { promisify } = require('util');
+    const execAsync = promisify(exec);
+
+    const containerName = process.env.BORGMATIC_CONTAINER || 'borgmatic';
+    const configDir = '/etc/borgmatic.d';
+
+    // List files in the borgmatic container
+    let listOutput;
+    try {
+      const { stdout } = await execAsync(`docker exec ${containerName} ls ${configDir}`);
+      listOutput = stdout;
+    } catch (err) {
+      console.error('Error listing borgmatic config files:', err);
+      return res.json({ configs: [], error: 'Unable to access borgmatic container or config directory' });
+    }
+
+    const files = listOutput.split('\n').filter(f => f.trim());
+    const yamlFiles = files.filter(file => file.endsWith('.yml') || file.endsWith('.yaml'));
+
+    if (yamlFiles.length === 0) {
+      return res.json({ configs: [], error: 'No configuration files found' });
+    }
+
+    // Read and parse each config file from the borgmatic container
+    const configs = [];
+    for (const file of yamlFiles) {
+      try {
+        const { stdout: content } = await execAsync(`docker exec ${containerName} cat ${configDir}/${file}`);
+        const parsed = yaml.load(content);
+
+        configs.push({
+          filename: file,
+          config: parsed
+        });
+      } catch (err) {
+        console.error(`Error reading config file ${file}:`, err);
+        configs.push({
+          filename: file,
+          error: `Failed to parse: ${err.message}`
+        });
+      }
+    }
+
+    res.json({ configs });
+  } catch (error) {
+    console.error('Error fetching borgmatic config:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Error handling middleware
 app.use((error, req, res, next) => {
   console.error('Unhandled error:', error);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found' });
+// Catch all handler for non-API routes - serve React app
+app.use((req, res, next) => {
+  // Only handle non-API routes
+  if (!req.path.startsWith('/api/')) {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+  } else {
+    res.status(404).json({ error: 'API endpoint not found' });
+  }
 });
 
 // Graceful shutdown

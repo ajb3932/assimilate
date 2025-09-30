@@ -17,6 +17,7 @@ CREATE TABLE repositories (
     location_type VARCHAR(20) NOT NULL CHECK (location_type IN ('local', 'remote')),
     repository_id VARCHAR(64) UNIQUE, -- The Borg repository ID
     encryption_mode VARCHAR(50),
+    size_on_disk_bytes BIGINT, -- Physical size of repository on disk
     last_modified TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP

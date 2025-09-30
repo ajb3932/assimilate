@@ -105,6 +105,47 @@ class BorgmaticStatsCollector:
             except yaml.YAMLError:
                 logger.error("Failed to parse borgmatic config YAML")
         return None
+
+    def get_repository_size(self, repo_path: str) -> Optional[int]:
+        """Get the physical size of the repository on disk in bytes"""
+        try:
+            # Try to get size using du command
+            if repo_path.startswith('ssh://'):
+                # For remote repos, use SSH through borgmatic container
+                # Parse SSH URL: ssh://user@host/path or ssh://user@host:port/path
+                import re
+                match = re.match(r'ssh://([^@]+)@([^:/]+)(?::(\d+))?(/.*)', repo_path)
+                if match:
+                    user = match.group(1)
+                    host = match.group(2)
+                    port = match.group(3)
+                    remote_path = match.group(4)
+
+                    # Build SSH command
+                    ssh_cmd = f"ssh {user}@{host}"
+                    if port:
+                        ssh_cmd += f" -p {port}"
+                    ssh_cmd += f" du -sb {remote_path}"
+
+                    logger.info(f"Getting remote repository size via SSH: {ssh_cmd}")
+                    output = self.run_docker_command(ssh_cmd)
+                    if output:
+                        # Parse the output: "1234567\t/path/to/repo"
+                        size_str = output.strip().split('\t')[0]
+                        return int(size_str)
+                else:
+                    logger.warning(f"Cannot parse SSH URL: {repo_path}")
+                    return None
+            else:
+                # For local repos, get size from within the container
+                output = self.run_docker_command(f"du -sb {repo_path}")
+                if output:
+                    # Parse the output: "1234567\t/path/to/repo"
+                    size_str = output.strip().split('\t')[0]
+                    return int(size_str)
+        except Exception as e:
+            logger.error(f"Failed to get repository size for {repo_path}: {e}")
+        return None
     
     def parse_database_listing(self, path: str) -> List[Dict]:
         """Parse database backup information from archive listing"""
@@ -141,10 +182,11 @@ class BorgmaticStatsCollector:
     def upsert_repository(self, repo_data: Dict) -> int:
         """Insert or update repository and return its ID"""
         self.cursor.execute("""
-            INSERT INTO repositories (name, path, location_type, repository_id, encryption_mode, last_modified)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (repository_id) 
-            DO UPDATE SET 
+            INSERT INTO repositories (name, path, location_type, repository_id, encryption_mode, size_on_disk_bytes, last_modified)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (repository_id)
+            DO UPDATE SET
+                size_on_disk_bytes = EXCLUDED.size_on_disk_bytes,
                 last_modified = EXCLUDED.last_modified,
                 updated_at = CURRENT_TIMESTAMP
             RETURNING id
@@ -154,6 +196,7 @@ class BorgmaticStatsCollector:
             repo_data['location_type'],
             repo_data['id'],
             repo_data.get('encryption_mode'),
+            repo_data.get('size_on_disk_bytes'),
             repo_data.get('last_modified')
         ))
         return self.cursor.fetchone()['id']
@@ -288,7 +331,12 @@ class BorgmaticStatsCollector:
                 
                 # Get encryption info
                 repo_data['encryption_mode'] = repo_info.get('encryption', {}).get('mode')
-                
+
+                # Get repository size on disk
+                repo_data['size_on_disk_bytes'] = self.get_repository_size(repo_data['location'])
+                if repo_data['size_on_disk_bytes']:
+                    logger.info(f"Repository {repo_data['label']} size on disk: {repo_data['size_on_disk_bytes']} bytes")
+
                 # Upsert repository
                 repo_id = self.upsert_repository(repo_data)
                 logger.info(f"Processing repository: {repo_data['label']} (ID: {repo_id})")
