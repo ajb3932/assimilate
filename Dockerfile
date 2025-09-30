@@ -41,7 +41,7 @@ COPY --from=frontend-builder /app/frontend/dist ./public
 RUN echo "0 * * * * cd /app && python3 collector/collector.py >> /var/log/collector.log 2>&1" > /etc/crontabs/root
 
 # Create startup script
-RUN printf '#!/bin/sh\nset -e\n\necho "Starting cron daemon..."\ncrond -l 2 -f &\n\necho "Starting API server..."\nexec node server.js\n' > /app/start.sh
+RUN printf '#!/bin/sh\nset -e\n\necho "Starting cron daemon..."\ncrond -l 2 -f &\n\necho "Running initial data collection..."\npython3 /app/collector/collector.py >> /var/log/collector.log 2>&1 &\n\necho "Starting API server..."\nexec node server.js\n' > /app/start.sh
 
 RUN chmod +x /app/start.sh
 
